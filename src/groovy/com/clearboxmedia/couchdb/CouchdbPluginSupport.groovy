@@ -30,12 +30,16 @@ import org.codehaus.groovy.grails.commons.GrailsDomainClassProperty
 import org.codehaus.groovy.grails.plugins.DomainClassPluginSupport
 import org.codehaus.groovy.grails.support.SoftThreadLocalMap
 import org.codehaus.groovy.grails.validation.GrailsDomainClassValidator
+import org.codehaus.groovy.grails.web.binding.DataBindingLazyMetaPropertyMap
+import org.codehaus.groovy.grails.web.binding.DataBindingUtils
 import org.jcouchdb.db.Database
 import org.jcouchdb.db.Options
 import org.jcouchdb.document.Attachment
 import org.jcouchdb.document.DesignDocument
+import org.jcouchdb.document.ValueRow
 import org.jcouchdb.exception.NotFoundException
 import org.jcouchdb.util.CouchDBUpdater
+import org.springframework.beans.BeanUtils
 import org.springframework.beans.factory.config.MethodInvokingFactoryBean
 import org.springframework.context.ApplicationContext
 import org.springframework.validation.BeanPropertyBindingResult
@@ -52,6 +56,17 @@ public class CouchdbPluginSupport {
     static def doWithSpring = {ApplicationContext ctx ->
 
         updateCouchViews(application)
+
+        // extend the jcouchdb ValueRow class to automatically look up properties of the internal value object
+        ValueRow.metaClass.propertyMissing = {String name ->
+            def value = delegate.value
+
+            if (!value[name]) {
+                throw new MissingPropertyException(name)
+            }
+
+            return value[name]
+        }
 
         // register our CouchDomainClass artefacts that weren't already picked up by grails
         application.domainClasses.each {GrailsDomainClass dc ->
@@ -166,6 +181,10 @@ public class CouchdbPluginSupport {
         }
 
         metaClass.delete = {->
+            delete(null)
+        }
+
+        metaClass.delete = {Map args = [:] ->
             couchdb.delete getDocumentId(domainClass, delegate), getDocumentVersion(domainClass, delegate)
         }
 
@@ -318,6 +337,19 @@ public class CouchdbPluginSupport {
 
         metaClass.getConstraints = {->
             domainClass.constrainedProperties
+        }
+
+        metaClass.constructor = {Map map ->
+            def instance = ctx.containsBean(domainClass.fullName) ? ctx.getBean(domainClass.fullName) : BeanUtils.instantiateClass(domainClass.clazz)
+            DataBindingUtils.bindObjectToDomainInstance(domainClass, instance, map)
+            DataBindingUtils.assignBidirectionalAssociations(instance, map, domainClass)
+            return instance
+        }
+        metaClass.setProperties = {Object o ->
+            DataBindingUtils.bindObjectToDomainInstance(domainClass, delegate, o)
+        }
+        metaClass.getProperties = {->
+            new DataBindingLazyMetaPropertyMap(delegate)
         }
 
         metaClass.hasErrors = {-> delegate.errors?.hasErrors() }
@@ -521,10 +553,10 @@ public class CouchdbPluginSupport {
                     options.put(key, value)
 
                 } else if (key == "max") {
-                    options.limit(value)
+                    options.putUnencoded("limit", value)
 
                 } else if (key == "offset") {
-                    options.skip(value)
+                    options.putUnencoded("skip", value)
 
                 } else if (key == "order") {
                     options.descending((value == "desc"))
