@@ -25,9 +25,17 @@ import org.apache.commons.lang.StringUtils
 import org.apache.commons.logging.Log
 import org.apache.commons.logging.LogFactory
 import org.codehaus.groovy.ast.ASTNode
+import org.codehaus.groovy.ast.AnnotatedNode
+import org.codehaus.groovy.ast.AnnotationNode
 import org.codehaus.groovy.ast.ClassNode
 import org.codehaus.groovy.ast.FieldNode
+import org.codehaus.groovy.ast.MethodNode
+import org.codehaus.groovy.ast.Parameter
 import org.codehaus.groovy.ast.PropertyNode
+import org.codehaus.groovy.ast.expr.ConstantExpression
+import org.codehaus.groovy.ast.expr.GStringExpression
+import org.codehaus.groovy.ast.expr.VariableExpression
+import org.codehaus.groovy.ast.stmt.ReturnStatement
 import org.codehaus.groovy.control.CompilePhase
 import org.codehaus.groovy.control.SourceUnit
 import org.codehaus.groovy.grails.commons.GrailsDomainClassProperty
@@ -38,10 +46,13 @@ import org.codehaus.groovy.transform.GroovyASTTransformation
  *
  * @author Cory Hacking
  */
-@GroovyASTTransformation(phase = CompilePhase.SEMANTIC_ANALYSIS)
+@GroovyASTTransformation(phase = CompilePhase.CANONICALIZATION)
 class CouchEntityASTTransformation implements ASTTransformation {
 
     private static final Log log = LogFactory.getLog(CouchEntityASTTransformation.class)
+
+    private static final String IDENTITY = GrailsDomainClassProperty.IDENTITY
+    private static final String VERSION = GrailsDomainClassProperty.VERSION
 
     private static final ClassNode COUCH_ENTITY = new ClassNode(CouchEntity)
 
@@ -52,66 +63,101 @@ class CouchEntityASTTransformation implements ASTTransformation {
     private static final ClassNode PERSISTENCE_VERSION = new ClassNode(Version)
 
     public void visit(ASTNode[] nodes, SourceUnit sourceUnit) {
-        def couchEntityClasses = sourceUnit.getAST().getClasses().findAll {ClassNode classNode ->
-            classNode.getAnnotations(COUCH_ENTITY)
+        if (nodes.length != 2 || !(nodes[0] instanceof AnnotationNode) || !(nodes[1] instanceof AnnotatedNode)) {
+            throw new RuntimeException("Internal error: expecting [AnnotationNode, AnnotatedNode] but got: " + Arrays.asList(nodes))
         }
 
-        // make sure that an id and version property is set on each of our CouchEntity classes 
-        couchEntityClasses.each {ClassNode classNode ->
+        AnnotationNode node = (AnnotationNode) nodes[0]
+        ClassNode owner = (ClassNode) nodes[1]
 
-            if (log.isDebugEnabled()) {
-                log.debug("[CouchEntityASTTransformation] scanning class [" + classNode.getName() + "]")
-            }
-
-            injectIdProperty classNode
-            injectVersionProperty classNode
-
-        }
+        injectIdProperty(owner)
+        injectVersionProperty(owner)
     }
 
     private void injectIdProperty(ClassNode classNode) {
-        final boolean hasAnnotatedId = classNode.fields.findAll {FieldNode fieldNode -> fieldNode.getAnnotations(COUCH_ID) || fieldNode.getAnnotations(PERSISTENCE_ID) }.size() > 0
-        if (!hasAnnotatedId) {
+        Collection<FieldNode> nodes = classNode.fields.findAll {FieldNode fieldNode -> fieldNode.getAnnotations(COUCH_ID) || fieldNode.getAnnotations(PERSISTENCE_ID) }
+        PropertyNode identity = getProperty(classNode, IDENTITY)
+
+        if (nodes) {
+            // look to see if the identity field was injected and not one of our annotated nodes
+            if (identity && identity.field.lineNumber < 0 && !nodes.findAll {FieldNode fieldNode -> fieldNode.name == identity.name}) {
+
+                // change the injected toString() method to use the proper id field
+                fixupToStringMethod(classNode, nodes[0])
+
+                // remove the old identifier
+                removeProperty(classNode, identity.name)
+            }
+        } else {
 
             // if we don't have an annotated id then look for a plain id field
-            final PropertyNode node = getDomainProperty(classNode, GrailsDomainClassProperty.IDENTITY)
-            if (node) {
-                if (node.type.typeClass != String.class && node.field.lineNumber < 0) {
-                    node.field.type = new ClassNode(String.class)
+            if (identity) {
+                if (identity.type.typeClass != String.class && identity.field.lineNumber < 0) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Changing the type of property [" + IDENTITY + "] of class [" + classNode.getName() + "] to String.")
+                    }
+                    identity.field.type = new ClassNode(String.class)
                 }
                 return
             }
 
             if (log.isDebugEnabled()) {
-                log.debug("[CouchEntityASTTransformation] Adding / modifying property [" + GrailsDomainClassProperty.IDENTITY + "] of class [" + classNode.getName() + "]")
+                log.debug("Adding property [" + IDENTITY + "] to class [" + classNode.getName() + "]")
             }
+            classNode.addProperty(IDENTITY, Modifier.PUBLIC, new ClassNode(String.class), null, null, null)
+        }
+    }
 
-            classNode.addProperty(GrailsDomainClassProperty.IDENTITY, Modifier.PUBLIC, new ClassNode(String.class), null, null, null)
+    private void fixupToStringMethod(ClassNode classNode, FieldNode idNode) {
+
+        MethodNode method = classNode.getDeclaredMethod("toString", [] as Parameter[]);
+        if (method != null && method.lineNumber < 0 && (method.isPublic() || method.isProtected()) && !method.isAbstract()) {
+            GStringExpression ge = new GStringExpression(classNode.getName() + ' : ${' + idNode.name + '}');
+            ge.addString(new ConstantExpression(classNode.getName() + " : "));
+            ge.addValue(new VariableExpression(idNode.name));
+
+            method.variableScope.removeReferencedClassVariable("id")
+            method.variableScope.putReferencedClassVariable(idNode)
+
+            method.code = new ReturnStatement(ge);
+
+            if (log.isDebugEnabled()) {
+                log.debug("Changing method [toString()] on class [" + classNode.getName() + "] to use id field [" + id + "]");
+            }
         }
     }
 
     private void injectVersionProperty(ClassNode classNode) {
-        final boolean hasAnnotatedVersion = classNode.fields.findAll {FieldNode fieldNode -> fieldNode.getAnnotations(COUCH_VERSION) || fieldNode.getAnnotations(PERSISTENCE_VERSION) }.size() > 0
-        if (!hasAnnotatedVersion) {
+        Collection<FieldNode> nodes = classNode.fields.findAll {FieldNode fieldNode -> fieldNode.getAnnotations(COUCH_VERSION) || fieldNode.getAnnotations(PERSISTENCE_VERSION) }
+        PropertyNode version = getProperty(classNode, VERSION)
 
-            // if we don't have an annotated id then look for a plain id field
-            final PropertyNode node = getDomainProperty(classNode, GrailsDomainClassProperty.VERSION)
-            if (node) {
-                if (node.type.typeClass != String.class && node.field.lineNumber < 0) {
-                    node.field.type = new ClassNode(String.class)
+        if (nodes) {
+            // look to see if the version field was injected and not one of our annotated nodes
+            if (version && version.field.lineNumber < 0 && !nodes.findAll {FieldNode fieldNode -> fieldNode.name == version.name}) {
+                removeProperty(classNode, version.name)
+            }
+
+        } else {
+
+            // if we don't have an annotated id then look for a plain version field
+            if (version) {
+                if (version.type.typeClass != String.class && version.field.lineNumber < 0) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("Changing the type of property [" + VERSION + "] of class [" + classNode.getName() + "] to String.")
+                    }
+                    version.field.type = new ClassNode(String.class)
                 }
                 return
             }
 
             if (log.isDebugEnabled()) {
-                log.debug("[CouchEntityASTTransformation] Adding / modifying property [" + GrailsDomainClassProperty.VERSION + "] of class [" + classNode.getName() + "]")
+                log.debug("Adding property [" + VERSION + "] to class [" + classNode.getName() + "]")
             }
-
-            classNode.addProperty(GrailsDomainClassProperty.VERSION, Modifier.PUBLIC, new ClassNode(String.class), null, null, null)
+            classNode.addProperty(VERSION, Modifier.PUBLIC, new ClassNode(String.class), null, null, null)
         }
     }
 
-    private PropertyNode getDomainProperty(ClassNode classNode, String propertyName) {
+    private PropertyNode getProperty(ClassNode classNode, String propertyName) {
         if (classNode == null || StringUtils.isBlank(propertyName))
             return null
 
@@ -124,5 +170,29 @@ class CouchEntityASTTransformation implements ASTTransformation {
         }
 
         return null
+    }
+
+    private removeProperty(ClassNode classNode, String propertyName) {
+        if (log.isDebugEnabled()) {
+            log.debug("Removing property [" + propertyName + "] from class [" + classNode.getName() + "]")
+        }
+
+        // remove the property from the fields and properties arrays
+        for (int i = 0; i < classNode.fields.size(); i++) {
+            if (classNode.fields[i].name == propertyName) {
+                classNode.fields.remove(i)
+                break
+            }
+        }
+        for (int i = 0; i < classNode.properties.size(); i++) {
+            if (classNode.properties[i].name == propertyName) {
+                classNode.properties.remove(i)
+                break
+            }
+        }
+
+        // this doesn't seem to be necessary (and is only technically possible
+        // because groovy ignores private scope), but we're going to try to be thorough.
+        classNode.getFieldIndexLazy().remove(propertyName)
     }
 }

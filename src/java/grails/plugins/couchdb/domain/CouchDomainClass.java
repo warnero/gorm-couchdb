@@ -33,6 +33,7 @@ import grails.plugins.couchdb.CouchVersion;
 import grails.util.GrailsNameUtils;
 
 import javax.persistence.Id;
+import javax.persistence.Transient;
 import javax.persistence.Version;
 import java.beans.PropertyDescriptor;
 import java.lang.annotation.IncompleteAnnotationException;
@@ -64,6 +65,8 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
     private CouchDomainClassProperty version;
     private CouchDomainClassProperty attachments;
     private String type;
+    private String typeFieldName;
+    private String designName;
 
     private Map constraints = new HashMap();
     private Validator validator;
@@ -89,6 +92,21 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
             // if the type wasn't set, then use the domain class name
             type = clazz.getSimpleName().toLowerCase();
         }
+
+        // try to read the "type" annotation property
+        try {
+            typeFieldName = entityAnnotation.typeFieldName();
+            if ("".equals(typeFieldName)) {
+                typeFieldName = "type";
+            } else if ("class".equals(typeFieldName) || "metaClass".equals(typeFieldName)) {
+                throw new GrailsDomainException("The CouchEntity annotation parameter [typeFieldName] on Class [" + clazz.getName() + "] cannot be set to 'class' or 'metaClass'.");
+            }
+        } catch (IncompleteAnnotationException ex) {
+            typeFieldName = "type";
+        }
+
+        // we always want a default design name even if the type is disabled
+        designName = (type != null) ? type : clazz.getSimpleName().toLowerCase();
 
         PropertyDescriptor[] descriptors = BeanUtils.getPropertyDescriptors(clazz);
         evaluateClassProperties(descriptors);
@@ -200,6 +218,14 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
         return this.type;
     }
 
+    public String getTypeFieldName() {
+        return this.typeFieldName;
+    }
+
+    public String getDesignName() {
+        return designName;
+    }
+
     public Map getAssociationMap() {
         return Collections.EMPTY_MAP;
     }
@@ -290,13 +316,12 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
 
         private Class ownerClass;
         private PropertyDescriptor descriptor;
-        private Field propertyField;
+        private Field field;
         private String name;
         private Class type;
         private GrailsDomainClass domainClass;
         private Method getter;
         private boolean persistent = true;
-        private Field field;
         private boolean identity = false;
 
         public CouchDomainClassProperty(GrailsDomainClass domain, PropertyDescriptor descriptor) {
@@ -314,8 +339,8 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
             }
 
             this.persistent = checkPersistence(descriptor);
-            List transientProps = getTransients(domainClass);
-            checkIfTransient(transientProps);
+
+            checkIfTransient();
         }
 
         private boolean checkPersistence(PropertyDescriptor descriptor) {
@@ -326,20 +351,26 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
         }
 
         // Checks whether this property is transient... copied from DefaultGrailsDomainClassProperty.
-        private void checkIfTransient(List transientProps) {
-            if (transientProps != null) {
-                for (Iterator i = transientProps.iterator(); i.hasNext();) {
+        private void checkIfTransient() {
+            if (isAnnotatedWith(Transient.class)) {
+                this.persistent = false;
 
-                    // make sure its a string otherwise ignore. Note: Again maybe a warning?
-                    Object currentObj = i.next();
-                    if (currentObj instanceof String) {
-                        String propertyName = (String) currentObj;
+            } else {
+                List transientProps = getTransients(domainClass);
+                if (transientProps != null) {
+                    for (Iterator i = transientProps.iterator(); i.hasNext();) {
 
-                        // if the property name is on the not persistant list
-                        // then set persistant to false
-                        if (propertyName.equals(this.name)) {
-                            this.persistent = false;
-                            break;
+                        // make sure its a string otherwise ignore. Note: Again maybe a warning?
+                        Object currentObj = i.next();
+                        if (currentObj instanceof String) {
+                            String propertyName = (String) currentObj;
+
+                            // if the property name is on the not persistant list
+                            // then set persistant to false
+                            if (propertyName.equals(this.name)) {
+                                this.persistent = false;
+                                break;
+                            }
                         }
                     }
                 }
@@ -500,10 +531,7 @@ public class CouchDomainClass extends AbstractGrailsClass implements GrailsDomai
         }
 
         public boolean isAnnotatedWith(Class annotation) {
-            if (field == null) {
-                return false;
-            }
-            return field.getAnnotation(annotation) != null;
+            return (field != null && field.getAnnotation(annotation) != null) || (getter != null && getter.getAnnotation(annotation) != null);
         }
 
         // grails 1.2 GrailsDomainClass

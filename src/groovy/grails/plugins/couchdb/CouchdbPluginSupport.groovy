@@ -22,6 +22,7 @@ import net.sf.json.JSONObject
 import net.sf.json.JSONSerializer
 import net.sf.json.JsonConfig
 import org.apache.commons.lang.StringUtils
+import org.apache.commons.lang.time.DateFormatUtils
 import org.apache.http.auth.AuthScope
 import org.apache.http.auth.UsernamePasswordCredentials
 import org.codehaus.groovy.grails.commons.GrailsApplication
@@ -37,6 +38,7 @@ import org.jcouchdb.db.Options
 import org.jcouchdb.document.Attachment
 import org.jcouchdb.document.DesignDocument
 import org.jcouchdb.document.ValueRow
+import org.jcouchdb.document.ViewResult
 import org.jcouchdb.exception.NotFoundException
 import org.jcouchdb.util.CouchDBUpdater
 import org.springframework.beans.BeanUtils
@@ -59,13 +61,20 @@ public class CouchdbPluginSupport {
 
         // extend the jcouchdb ValueRow class to automatically look up properties of the internal value object
         ValueRow.metaClass.propertyMissing = {String name ->
-            HashMap map = delegate.value
+            Map map = delegate.value
 
             if (map == null || !map.containsKey(name)) {
                 throw new MissingPropertyException(name)
             }
 
-            return map.get(name)
+            // look for a property of the same name in our domain class
+            Object value = map.get(name)
+            Class type = map.get('_domainClass')?.getPropertyByName(name)?.type
+            if (value != null && type != null && !(type instanceof String) && !value.class.isAssignableFrom(type)) {
+                value = CouchJsonConfig.morph(type, value)
+                map.put(name, value)
+            }
+            return value
         }
 
         // register our CouchDomainClass artefacts that weren't already picked up by grails
@@ -114,6 +123,7 @@ public class CouchdbPluginSupport {
 
             addInstanceMethods(application, domainClass, ctx, db)
             addStaticMethods(application, domainClass, ctx, db)
+            addDynamicFinderSupport(application, domainClass, ctx, db)
 
             addValidationMethods(application, domainClass, ctx)
 
@@ -210,7 +220,7 @@ public class CouchdbPluginSupport {
         def domainClass = dc
         def couchdb = db
 
-        metaClass.'static'.get = {Serializable docId ->
+        metaClass.static.get = {Serializable docId ->
             try {
                 // read the json document from the database
                 def json = couchdb.getDocument(JSONObject.class, docId.toString())
@@ -227,19 +237,19 @@ public class CouchdbPluginSupport {
         }
 
         // Foo.exists(1)
-        metaClass.'static'.exists = {Serializable docId ->
+        metaClass.static.exists = {Serializable docId ->
             get(docId) != null
         }
 
-        metaClass.'static'.delete = {Serializable docId, String version ->
+        metaClass.static.delete = {Serializable docId, String version ->
             couchdb.delete docId.toString(), version
         }
 
-        metaClass.'static'.bulkSave = {List documents ->
+        metaClass.static.bulkSave = {List documents ->
             return bulkSave(documents, false)
         }
 
-        metaClass.'static'.bulkSave = {List documents, Boolean allOrNothing ->
+        metaClass.static.bulkSave = {List documents, Boolean allOrNothing ->
             def couchDocuments = []
 
             documents.each {doc ->
@@ -249,11 +259,11 @@ public class CouchdbPluginSupport {
             return couchdb.bulkCreateDocuments(couchDocuments, allOrNothing)
         }
 
-        metaClass.'static'.bulkDelete = {List documents ->
+        metaClass.static.bulkDelete = {List documents ->
             return bulkDelete(documents, false)
         }
 
-        metaClass.'static'.bulkDelete = {List documents, boolean allOrNothing ->
+        metaClass.static.bulkDelete = {List documents, boolean allOrNothing ->
             def couchDocuments = new ArrayList()
 
             documents.each {doc ->
@@ -264,57 +274,87 @@ public class CouchdbPluginSupport {
             return couchdb.bulkDeleteDocuments(couchDocuments, allOrNothing)
         }
 
-        metaClass.'static'.getAttachment = {Serializable docId, String attachmentId ->
+        metaClass.static.readAttachment = {Serializable docId, String attachmentId ->
             return couchdb.getAttachment(docId.toString(), attachmentId)
         }
 
-        metaClass.'static'.saveAttachment = {Serializable docId, String version, String attachmentId, String contentType, byte[] data ->
+        metaClass.static.saveAttachment = {Serializable docId, String version, String attachmentId, String contentType, byte[] data ->
             return couchdb.createAttachment(docId.toString(), version, attachmentId, contentType, data)
         }
 
-        metaClass.'static'.saveAttachment = {Serializable docId, String version, String attachmentId, String contentType, InputStream is, long length ->
+        metaClass.static.saveAttachment = {Serializable docId, String version, String attachmentId, String contentType, InputStream is, long length ->
             return couchdb.createAttachment(docId.toString(), version, attachmentId, contentType, is, length)
         }
 
-        metaClass.'static'.deleteAttachment = {Serializable docId, String version, String attachmentId ->
+        metaClass.static.deleteAttachment = {Serializable docId, String version, String attachmentId ->
             return couchdb.deleteAttachment(docId.toString(), version, attachmentId)
         }
 
-        metaClass.'static'.findAll = {Map o = [:] ->
-            return findAll(getOptions(o))
+        metaClass.static.findAll = {Map o = [:] ->
+            return couchdb.listDocuments(getOptions(o), null).getRows()
         }
 
-        metaClass.'static'.findAll = {Options o ->
-            return couchdb.listDocuments(o, null).getRows()
+        metaClass.static.count = {Map o = [:] ->
+            return count(null, o)
         }
 
-        metaClass.'static'.findAllByUpdateSequence = {Map o = [:] ->
-            return findAllByUpdateSequence(getOptions(o))
+        metaClass.static.count = {String viewName, Map o = [:] ->
+            def view = viewName
+            if (!view) {
+                view = "count"
+            }
+            if (!view.contains("/")) {
+                view = domainClass.designName + "/" + view
+            }
+
+            def count = couchdb.queryView(view, Map.class, getOptions(o), null).getRows()
+
+            return (count ? count[0].value : 0) as Long
         }
 
-        metaClass.'static'.findAllByUpdateSequence = {Options o ->
-            return couchdb.listDocumentsByUpdateSequence(o, null).getRows()
+        metaClass.static.list = {Map o = [:] ->
+            return list(null, o)
         }
 
-        metaClass.'static'.findByView = {String viewName, Map o = [:] ->
-            return findByView(viewName, getOptions(o))
+        metaClass.static.list = {String viewName, Map o = [:] ->
+            def view = viewName
+            if (!view) {
+                view = "list"
+            }
+
+            return queryView(view, o)
         }
 
-        metaClass.'static'.findByView = {String viewName, Options o ->
-            return couchdb.queryView(viewName, Map.class, o, null).getRows()
+        metaClass.static.queryView = {String viewName, Map o = [:] ->
+            def view = viewName
+            if (!view.contains("/")) {
+                view = domainClass.designName + "/" + view
+            }
+            ViewResult result = couchdb.queryView(view, Map.class, getOptions(o), null)
+            result.getRows().each {row -> row.value?.put('_domainClass', dc)}
+
+            return result.getRows()
         }
 
-        metaClass.'static'.findByViewAndKeys = {String viewName, List keys, Map o = [:] ->
-            return findByViewAndKeys(viewName, keys, getOptions(o));
+        metaClass.static.queryViewByKeys = {String viewName, List keys, Map o = [:] ->
+            def view = viewName
+            if (!view.contains("/")) {
+                view = domainClass.designName + "/" + view
+            }
+
+            ViewResult result = couchdb.queryViewByKeys(view, Map.class, convertKeys(keys), getOptions(o), null)
+            result.getRows().each {row -> row.value?.put('_domainClass', dc)}
+
+            return result.getRows()
         }
 
-        metaClass.'static'.findByViewAndKeys = {String viewName, List keys, Options o ->
-            return couchdb.queryViewByKeys(viewName, Map.class, keys, o, null).getRows();
-        }
-
-        metaClass.'static'.getDesignDocument = {Serializable id ->
+        metaClass.static.getDesignDocument = {String id ->
             try {
-                return couchdb.getDesignDocument(id.toString())
+                def view = id
+                if (!view) {
+                    view = domainClass.designName
+                }
+                return couchdb.getDesignDocument(view)
             } catch (NotFoundException e) {
                 // fall through to return null
             }
@@ -322,8 +362,68 @@ public class CouchdbPluginSupport {
             return null
         }
 
-        metaClass.'static'.saveDesignDocument = {DesignDocument doc ->
+        metaClass.static.saveDesignDocument = {DesignDocument doc ->
+            if (!doc.id) {
+                doc.id = domainClass.designName
+            }
+
             return couchdb.createOrUpdateDocument(doc)
+        }
+    }
+
+    private static addDynamicFinderSupport(GrailsApplication application, CouchDomainClass dc, ApplicationContext ctx, Database db) {
+        def metaClass = dc.metaClass
+        def domainClass = dc
+        def couchdb = db
+
+        // This adds basic dynamic finder support.
+        metaClass.static.methodMissing = {String methodName, args ->
+
+            // find methods (can have search keys)
+            def matcher = (methodName =~ /^(find)(\w+)$/)
+            if (!matcher.matches()) {
+
+                // list methods (just contains options)
+                matcher = (methodName =~ /^(list)(\w+)$/)
+                matcher.reset()
+                if (!matcher.matches()) {
+
+                    // count methods (only options)
+                    matcher = (methodName =~ /^(count)(\w+)$/)
+                    matcher.reset()
+                    if (!matcher.matches()) {
+                        throw new MissingMethodException(methodName, delegate, args, true)
+                    }
+                }
+            }
+
+            // set the view to everything after the method type (change first char to lowerCase).
+            def method = matcher.group(1)
+            def view = matcher.group(2)
+            view = domainClass.designName + "/" + view.substring(0, 1).toLowerCase() + view.substring(1)
+
+            // options should be the last map argument.
+            args = args.toList()
+            def options = (args.size() > 0 && args[args.size() - 1] instanceof Map) ? args.remove(args.size() - 1) : [:]
+
+            // call the appropriate query and return the results
+            if (method == "find") {
+
+                // assume that the list of keys (if any) is everything else
+                def keys = (args ?: [])
+                if (keys) {
+                    return queryViewByKeys(view, keys, options);
+                } else {
+                    return queryView(view, options)
+                }
+
+            } else if (method == "list") {
+                return queryView(view, options)
+
+            } else {
+                return count(view, options)
+
+            }
         }
     }
 
@@ -331,7 +431,7 @@ public class CouchdbPluginSupport {
         def metaClass = dc.metaClass
         def domainClass = dc
 
-        metaClass.'static'.getConstraints = {->
+        metaClass.static.getConstraints = {->
             domainClass.constrainedProperties
         }
 
@@ -414,7 +514,7 @@ public class CouchdbPluginSupport {
 
             MetaProperty property = metaClass.hasProperty(dc, GrailsDomainClassProperty.DATE_CREATED)
             def time = System.currentTimeMillis()
-            if (property && getDocumentVersion(dc, domain) == null) {
+            if (property && domain[property.name] == null && getDocumentVersion(dc, domain) == null) {
                 def now = property.getType().newInstance([time] as Object[])
                 domain[property.name] = now
             }
@@ -424,10 +524,6 @@ public class CouchdbPluginSupport {
                 def now = property.getType().newInstance([time] as Object[])
                 domain[property.name] = now
             }
-        } else {
-
-            // todo: what do we do with an object we don't know how to convert?
-
         }
 
         return domain
@@ -442,7 +538,7 @@ public class CouchdbPluginSupport {
         def attachments = json.remove("_attachments")
 
         if (dc.type) {
-            json.remove("type")
+            json.remove(dc.typeFieldName)
         }
 
         def doc = JSONSerializer.toJava(json, jsonConfig);
@@ -466,9 +562,15 @@ public class CouchdbPluginSupport {
                 // the type should be.  I'm sure there's another way to do this, but I really
                 // just want to use the standard jcouchdb / svenson libs so we'll wait for
                 // that work instead.
-                jsonConfig.setRootClass(Attachment.class)
-                attachments.each {key, value ->
-                    converted.put(key, JSONSerializer.toJava(value, jsonConfig))
+                attachments.each {String key, value ->
+                    Attachment att = new Attachment()
+
+                    att.stub = true
+                    att.contentType = value["content_type"]
+                    att.length = value['length']
+                    att.revPos = value['revpos']
+
+                    converted.put(key, att)
                 }
             }
 
@@ -490,7 +592,7 @@ public class CouchdbPluginSupport {
             // set the document type if it is enabled set it first, so that it can be
             //  overridden by an actual type property if there is one...
             if (dc.type) {
-                doc["type"] = dc.type
+                doc[dc.typeFieldName] = dc.type
             }
 
             // set all of the persistant properties.
@@ -541,7 +643,7 @@ public class CouchdbPluginSupport {
 
         String host = ds?.host ?: "localhost"
         Integer port = ds?.port ?: 5984
-        String database = ds?.database ?: ""
+        String database = ds?.database ?: application.metadata["app.name"]
         String username = ds?.username ?: ""
         String password = ds?.password ?: ""
 
@@ -578,17 +680,17 @@ public class CouchdbPluginSupport {
                     case "endkey":
                     case "endkey_docid":
                         // keys need to be encoded
-                        options.put(key, value)
+                        options.put(key, convertKey(value))
                         break
 
                     case "max":
                     case "limit":
-                        options.putUnencoded("limit", value)
+                        options.put("limit", value)
                         break
 
                     case "offset":
                     case "skip":
-                        options.putUnencoded("skip", value)
+                        options.put("skip", value)
                         break
 
                     case "order":
@@ -600,7 +702,7 @@ public class CouchdbPluginSupport {
                     case "stale":
                     case "reduce":
                     case "include_docs":
-                        options.putUnencoded(key, value)
+                        options.put(key, value)
                         break
 
                     default:
@@ -611,5 +713,28 @@ public class CouchdbPluginSupport {
         }
 
         return options
+    }
+
+    private static List convertKeys(List keys) {
+        def values = []
+        keys.each {key ->
+            values << convertKey(key)
+        }
+
+        return values
+    }
+
+    private static Object convertKey(Object key) {
+        def value = key
+
+        if (value instanceof java.sql.Date) {
+            value = new Date(((java.sql.Date) value).getTime());
+        }
+
+        if (value instanceof Date) {
+            value = DateFormatUtils.formatUTC((Date) key, CouchJsonDateValueProcessor.DATE_PATTERN)
+        }
+
+        return value
     }
 }

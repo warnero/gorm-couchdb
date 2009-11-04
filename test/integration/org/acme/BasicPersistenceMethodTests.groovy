@@ -15,7 +15,6 @@
  */
 package org.acme
 
-import org.acme.Contact.Gender
 import org.jcouchdb.document.DesignDocument
 import org.jcouchdb.document.DocumentInfo
 import org.jcouchdb.document.View
@@ -27,17 +26,53 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
 
     static transactional = false
 
-    void testDesignDocument() {
+    void testInjection() {
+        def id = "gorm-test-id"
+        def version = "1-22ba1c6f98a7a0981fe4b716a1153e16"
 
-        def design = Task.getDesignDocument("tasks")
-        if (!design) {
-            design = new DesignDocument("tasks");
+        // test that the id & version WERE injected into the Project class
+        def p = new Project()
+        p.id = id
+        p.version = version
+
+        assertTrue "Project id should be a string", p.id instanceof String
+        assertTrue "Project version should be a string", p.version instanceof String
+
+        assertEquals "Project id should be ${id}", id, p.id
+        assertEquals "Project version should be ${version}", version, p.version
+
+        // test that the id & version were not injected in (or were removed from) the Task class
+        def t = new Task()
+        try {
+            t.id = id
+            fail "the injected id field should have been removed from the Task class"
+        } catch (Exception e) {
+            assertTrue "should have thrown a MissingPropertyException", e instanceof MissingPropertyException
         }
 
-        if (!design.views["byName"]) {
+        try {
+            t.version = version
+            fail "the injected version field should have been removed from the Task class"
+        } catch (Exception e) {
+            assertTrue "should have thrown a MissingPropertyException", e instanceof MissingPropertyException
+        }
+
+        t.taskId = "gorm-couchdb"
+        assertTrue "toString() should return the class name and taskId", (t.class.getName() + " : ${t.taskId}") == t.toString()
+
+    }
+
+    void testDesignDocument() {
+
+        def design = Task.getDesignDocument()
+        if (!design) {
+            design = new DesignDocument();
+        }
+
+        if (!design.views["allByName"]) {
 
             // add a temporary "open" view
-            design.addView("byName", new View("function(doc) { if (doc.type == 'project-task') { emit(doc.name, null); }}"))
+            design.addView("allByName", new View("function(doc) { if (doc.meta == 'project-task') { emit(doc.name, null); }}"))
 
             // save the design document
             Task.saveDesignDocument(design)
@@ -57,6 +92,7 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         def p1 = new Project(name: "InConcert")
 
         p1.startDate = new Date()
+        p1.pass = "transient test"
 
         p1.save()
 
@@ -73,6 +109,7 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         assertNotNull "should have retrieved a project", p2
         assertEquals "project ids should be equal", p1.id, p2.id
         assertEquals "project revisions should be equal", p1.version, p2.version
+        assertTrue "the project field 'pass' is transient and should not have been saved", p1.pass != p2.pass
 
         Thread.currentThread().sleep(1000);
 
@@ -80,7 +117,24 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         assertTrue "lastUpdated should be different", !p1.lastUpdated.equals(p2.lastUpdated)
         assertTrue "p2.lastUpdated should be after p1.lastUpdated", p1.lastUpdated.before(p2.lastUpdated)
 
+        def t1 = new Task()
+        t1.taskId = "${p2.id}-task"
+        t1.name = "task"
+        t1.projectId = p2.id
+        t1.startDate = new Date()
+        t1.description = "This is the description."
+        t1.estimatedHours = 5
+        t1.pass = "transient test"
+
+        t1.save()
+
+        def t2 = Task.get(t1.taskId)
+        assertNotNull "should have retrieved a task", t2
+        assertTrue "the task field 'pass' is transient and should not have been saved", t1.pass != t2.pass
+
         p2.delete()
+        t2.delete()
+
     }
 
     void testUpdateAndDelete() {
@@ -111,6 +165,9 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
 
     void testBulkSave() {
         def bulkDocuments = []
+
+        Date startDate
+
         def id = "gorm-couchdb"
 
         // get (or create) our test project
@@ -123,6 +180,8 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
             p.startDate = new Date()
             p.save()
         }
+
+        assertEquals "should have 1 project", 1, Project.count()
 
         // update the last updated date and add to our bulk documents
         p.lastUpdated = new Date()
@@ -137,6 +196,11 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
             t.projectId = p.id
             t.startDate = new Date()
             t.description = "This is the description for task ${i}."
+            t.estimatedHours = i
+
+            if (!startDate) {
+                startDate = t.startDate
+            }
 
             bulkDocuments << t
         }
@@ -167,47 +231,51 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         assertTrue "lastUpdated should be different", !t1.lastUpdated.equals(t2.lastUpdated)
         assertTrue "t2.lastUpdated should be after t1.lastUpdated", t2.lastUpdated.after(t1.lastUpdated)
 
+        // test date finder here
+        result = Task.findOpenTasksByStartDate(startDate)
+        assertTrue "should have found at least 1 task (depends upon timing)", result.size() >= 1
     }
 
     void testFind() {
 
         def result = Project.findAll()
+
+        result = Task.list()
         result.each {info ->
             println info
+            assertTrue "startDate should be a Date object", info.startDate instanceof Date
+            assertTrue "estimatedHours should be an Integer object", info.estimatedHours instanceof Integer
         }
+        assertEquals "should have found 20 tasks", 20, result.size()
 
-        result = Project.findAllByUpdateSequence()
-        result.each {info ->
-            println info
-        }
+        result = Task.list([max: 10])
+        assertEquals "should have found 10 tasks", 10, result.size()
 
-        result = Project.findByView("openTasks/byName")
+        result = Task.listOpenTasksByName(["order": "desc"])
         assertEquals "should have found 20 open tasks", 20, result.size()
-        result.each {info ->
-            println info
-        }
 
-        result = Project.findByView("openTasks/byName", ["offset": 5, "max": 10])
+        assertEquals "should have counted 20 open tasks", 20, Task.countOpenTasks()
+
+        result = Task.findOpenTasksByName(["offset": 5, "max": 10])
         assertEquals "should have found 10 open tasks", 10, result.size()
 
-        result = Project.findByView("openTasks/byName", ['startkey': "task-1", 'endkey': "task-10"])
+        result = Task.findOpenTasksByName(['startkey': "task-1", 'endkey': "task-10"])
         assertEquals "should have found 2 open tasks", 2, result.size()
         result.each {info ->
             println info
         }
 
-        def descending = Project.findByView("openTasks/byName", ['startkey': "task-10", 'endkey': "task-1", "order": "desc"])
+        def descending = Task.queryView("openTasksByName", ['startkey': "task-10", 'endkey': "task-1", "order": "desc"])
         assertEquals "should have found 2 open tasks", descending.size(), 2
         assertEquals "should be in reverse order", result[0].id, descending[1].id
         assertEquals "should be in reverse order", result[1].id, descending[0].id
 
-        result = Project.findByViewAndKeys("openTasks/byName", ["task-15"])
-        assertEquals "should have found 1 open task", 1, result.size()
-        result.each {info ->
-            println info
-            assertEquals "should have found task #15", "task-15", info.key
-        }
+        result = Task.findOpenTasksByName("task-15", "task-16", "task-17", ["order": "desc"])
+        assertEquals "should have found 3 open tasks", 3, result.size()
+        assertEquals "should have found task #15", "task-15", result[0].key
 
+        result = Task.findByProjectIdAndName(["gorm-couchdb", "task-1"])
+        assertEquals "should have found 'gorm-couchdb-task-1'", "gorm-couchdb-task-1", result[0].id
     }
 
     void testBulkDelete() {
@@ -275,13 +343,15 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         p.save()
 
         def att = new File("grails-app/conf/DataSource.groovy")
-        p.saveAttachment(att.path, "text", att.newInputStream(), att.length())
+        p.saveAttachment(att.path, "text/plain", att.newInputStream(), att.length())
 
         p = Project.get(id)
         assertEquals "should have one attachment", 1, p.attachments.size()
+        assertEquals "contentType should be 'text/plain'", 'text/plain', p.attachments[att.path].contentType
+        assertEquals "length should be '${att.length()}", att.length(), p.attachments[att.path].length
 
-        def att2 = new File("grails-app/conf/UrlMappings.groovy")
-        p.saveAttachment(att2.path, "text", att2.newInputStream(), att2.length())
+        def att2 = new File("test/integration/org/acme/BasicPersistenceMethodTests.groovy")
+        p.saveAttachment(att2.path, "text/plain", att2.newInputStream(), att2.length())
 
         p = Project.get(id)
         assertEquals "should have two attachments", 2, p.attachments.size()
@@ -297,5 +367,24 @@ public class BasicPersistenceMethodTests extends GroovyTestCase {
         assertEquals "should have one attachmens", 1, p.attachments.size()
 
         p.delete()
+    }
+
+    void testUnicode() {
+        def id = "unicode-test-正規"
+
+        def p = Project.get(id)
+        if (!p) {
+            p = new Project()
+            p.id = id
+        }
+
+        p.name = "»» 正規表達式 ... \u6B63"
+
+        p.save()
+
+        def p2 = Project.get(id)
+        assertEquals "Unicode name should be the same", p.name, p2.name
+
+        p2.delete()
     }
 }
