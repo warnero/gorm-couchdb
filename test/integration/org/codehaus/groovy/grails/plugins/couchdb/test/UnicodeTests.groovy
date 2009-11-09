@@ -13,22 +13,37 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package grails.plugins.couchdb.json;
+package org.codehaus.groovy.grails.plugins.couchdb.test
 
-import org.svenson.converter.TypeConverter;
-
-import java.util.Date;
+import org.acme.Project
 
 /**
+ *
  * @author Cory Hacking
  */
-public class JsonDateConverter implements TypeConverter {
+class UnicodeTests extends GroovyTestCase {
 
-    public Object fromJSON(Object value) {
-        return JsonConverterUtils.fromJSON(Date.class, value);
-    }
+    void testSaveUnicodeData() {
+        def id = "unicode-test-正規"
 
-    public Object toJSON(Object value) {
-        return JsonConverterUtils.toJSON(value);
+        def p = Project.get(id)
+        if (p) {
+            p.delete()
+        }
+
+        p = new Project()
+
+        p.id = id
+        p.name = "»» 正規表達式 ... \u6B63"
+        p.save()
+
+        assertNotNull "should have saved new unicode project", p.version
+
+        def p2 = Project.get(id)
+
+        assertNotNull "should have read unicode project", p2
+        assertEquals "Unicode name should be the same", p.name, p2.name
+
+        p2.delete()
     }
 }

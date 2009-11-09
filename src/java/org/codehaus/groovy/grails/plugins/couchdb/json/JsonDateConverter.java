@@ -13,24 +13,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.acme
+package org.codehaus.groovy.grails.plugins.couchdb.json;
 
-import grails.test.*
+import org.svenson.converter.TypeConverter;
+
+import java.util.Date;
 
 /**
- *
- * @author Warner Onstine, Cory Hacking
+ * @author Cory Hacking
  */
-class TaskTests extends GrailsUnitTestCase {
-    protected void setUp() {
-        super.setUp()
+public class JsonDateConverter implements TypeConverter {
+
+    public Object fromJSON(Object value) {
+        return JsonConverterUtils.fromJSON(Date.class, value);
     }
 
-    protected void tearDown() {
-        super.tearDown()
-    }
-
-    void testSomething() {
-
+    public Object toJSON(Object value) {
+        return JsonConverterUtils.toJSON(value);
     }
 }
